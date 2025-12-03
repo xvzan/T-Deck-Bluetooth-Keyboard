@@ -17,6 +17,20 @@
 #define BOARD_POWERON 10
 #define BOARD_I2C_SDA 18
 #define BOARD_I2C_SCL 8
+#define DOUBLE_CLICK_TIME 300 // 双击时间间隔（毫秒）
+#define LONG_PRESS_TIME 300   // 双击时间间隔（毫秒）
+
+enum SymState
+{
+    SYM_OFF,           // 普通字母输入
+    SYM_HOLD,          // 按住 Sym
+    SYM_SINGLE,        // 单击 Sym（一次符号输入）
+    SYM_LOCK,          // 双击 Sym（锁定符号输入）
+    SYM_EXITING_LOCK,  // 辅助状态
+    SYM_EXITING_SINGLE // 辅助状态
+};
+SymState symState = SYM_OFF;
+static bool symPressedLast = false;
 
 TFT_eSPI tft;
 String message = "Hello World!";
@@ -29,9 +43,12 @@ BLEAdvertising *pAdvertising;
 bool bleConnected = false;
 bool symbolMode = false;
 
+static unsigned long lastSymPress = 0;
+static unsigned long lastClickTime = 0;
+
 // 扫描状态
 bool curState[colCount][rowCount] = {0};
-bool lastState[colCount][rowCount] = {0};
+uint8_t lastCols[colCount] = {0};
 
 // 上一份已发送的 HID 输入报告（8 字节键盘）
 uint8_t lastReport[8] = {0};
@@ -52,8 +69,8 @@ void buildCurrentReport(uint8_t report[8])
         {
             if (!curState[col][row])
                 continue;
-            const Key &k = symbolMode ? keymap_symbol_flat[col * rowCount + row]
-                                      : keymap_flat[col * rowCount + row];
+            const Key &k = symState != SYM_OFF ? keymap_symbol_flat[col * rowCount + row]
+                                               : keymap_flat[col * rowCount + row];
             modifier |= k.mod;
             if (k.hid && idx < 6)
                 keys[idx++] = k.hid;
@@ -74,6 +91,18 @@ bool reportChanged(const uint8_t a[8], const uint8_t b[8])
     for (int i = 0; i < 8; i++)
         if (a[i] != b[i])
             return true;
+    return false;
+}
+
+bool colChanged(const uint8_t curCols[], const uint8_t lastCols[], int colCount)
+{
+    for (int col = 0; col < colCount; col++)
+    {
+        if (curCols[col] != lastCols[col])
+        {
+            return true; // 某一列的字节不同 → 有按键变化
+        }
+    }
     return false;
 }
 
@@ -210,8 +239,8 @@ void loop()
     {
         cols[got++] = Wire.read();
     }
-
-    // 更新当前矩阵状态
+    if (symState == SYM_EXITING_SINGLE)
+        symState = SYM_OFF;
     for (int col = 0; col < colCount; col++)
     {
         uint8_t val = cols[col];
@@ -219,39 +248,89 @@ void loop()
         {
             bool pressed = ((val >> row) & 0x01) != 0;
             curState[col][row] = pressed;
+            if (pressed && symState == SYM_SINGLE && keymap_symbol_flat[col * rowCount + row].hid != 0x00)
+            {
+                symState = SYM_EXITING_SINGLE;
+            }
         }
     }
 
-    if (curState[0][2])
+    bool symPressed = curState[0][2]; // 假设 Sym 键在矩阵 [0][2]
+
+    if (symPressed && !symPressedLast)
     {
-        symbolMode = true;
-    }
-    else
-    {
-        symbolMode = false;
+        // 按下事件
+        lastSymPress = millis();
+        switch (symState)
+        {
+        case SYM_LOCK:
+            symState = SYM_EXITING_LOCK;
+            break;
+        case SYM_OFF:
+            symState = SYM_HOLD;
+            break;
+        default:
+            break;
+        }
     }
 
+    else if (!symPressed && symPressedLast)
+    {
+        // 释放事件
+        unsigned long duration = millis() - lastSymPress;
+
+        if (duration < LONG_PRESS_TIME)
+        {
+            // 短按 → 单击
+            if (millis() - lastClickTime < DOUBLE_CLICK_TIME)
+            {
+                symState = (symState == SYM_LOCK) ? SYM_OFF : SYM_LOCK;
+            }
+            else
+            {
+                switch (symState)
+                {
+                case SYM_SINGLE:
+                    symState = SYM_OFF;
+                    break;
+                case SYM_EXITING_LOCK:
+                    symState = SYM_OFF;
+                    break;
+                default:
+                    symState = SYM_SINGLE;
+                    break;
+                }
+            }
+            lastClickTime = millis();
+        }
+        else
+        {
+            symState = SYM_OFF;
+        }
+    }
+
+    symPressedLast = symPressed;
+
     // 构造并发送当前报告（仅在变化时）
-    if (bleConnected)
+    if (bleConnected && colChanged(cols, lastCols, colCount))
     {
         uint8_t report[8];
         buildCurrentReport(report);
-        // sendCurrentReport(report);
-        if (reportChanged(report, lastReport))
-        {
-            sendCurrentReport(report);
-            memcpy(lastReport, report, 8);
-        }
+        sendCurrentReport(report);
+        // if (reportChanged(report, lastReport))
+        // {
+        //     sendCurrentReport(report);
+        //     memcpy(lastReport, report, 8);
+        // }
+        memcpy(lastCols, cols, colCount);
     }
 
-    static bool lastSymbolMode = false;
-    if (symbolMode != lastSymbolMode)
+    static SymState lastSymState = SYM_OFF;
+    if (symState != lastSymState)
     {
         tft.fillScreen(TFT_BLACK);
-        if (symbolMode)
-            tft.drawString("Sym", TFT_HEIGHT / 2, TFT_WIDTH / 2);
-        lastSymbolMode = symbolMode;
+        tft.drawString(String(symState), 20, 20);
+        lastSymState = symState;
     }
-
     delay(15); // 扫描间隔
 }
