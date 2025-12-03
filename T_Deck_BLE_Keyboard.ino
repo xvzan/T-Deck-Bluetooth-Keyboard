@@ -30,7 +30,11 @@ enum SymState
     SYM_EXITING_SINGLE // 辅助状态
 };
 SymState symState = SYM_OFF;
+SymState shiftState = SYM_OFF;
+SymState altState = SYM_OFF;
 static bool symPressedLast = false;
+static bool shiftPressedLast = false;
+static bool altPressedLast = false;
 
 TFT_eSPI tft;
 String message = "Hello World!";
@@ -44,6 +48,8 @@ bool bleConnected = false;
 bool symbolMode = false;
 
 static unsigned long lastSymPress = 0;
+static unsigned long lastShiftPress = 0;
+static unsigned long lastAltPress = 0;
 static unsigned long lastClickTime = 0;
 
 // 扫描状态
@@ -62,6 +68,14 @@ void buildCurrentReport(uint8_t report[8])
     uint8_t modifier = 0;
     uint8_t keys[6] = {0};
     int idx = 0;
+    if (shiftState != SYM_OFF)
+    {
+        modifier |= 0x02; // 左 Shift
+    }
+    if (altState != SYM_OFF)
+    {
+        modifier |= 0x04; // 左 Alt
+    }
 
     for (int col = 0; col < colCount; col++)
     {
@@ -229,31 +243,8 @@ void setup()
     memset(lastReport, 0, sizeof(lastReport));
 }
 
-void loop()
+void symStateMachine()
 {
-    // 读取列状态
-    Wire.requestFrom(LILYGO_KB_SLAVE_ADDRESS, colCount);
-    uint8_t cols[colCount] = {0};
-    int got = 0;
-    while (Wire.available() && got < colCount)
-    {
-        cols[got++] = Wire.read();
-    }
-    if (symState == SYM_EXITING_SINGLE)
-        symState = SYM_OFF;
-    for (int col = 0; col < colCount; col++)
-    {
-        uint8_t val = cols[col];
-        for (int row = 0; row < rowCount; row++)
-        {
-            bool pressed = ((val >> row) & 0x01) != 0;
-            curState[col][row] = pressed;
-            if (pressed && symState == SYM_SINGLE && keymap_symbol_flat[col * rowCount + row].hid != 0x00)
-            {
-                symState = SYM_EXITING_SINGLE;
-            }
-        }
-    }
 
     bool symPressed = curState[0][2]; // 假设 Sym 键在矩阵 [0][2]
 
@@ -310,6 +301,170 @@ void loop()
     }
 
     symPressedLast = symPressed;
+}
+
+void shiftStateMachine()
+{
+    bool shiftPressed = curState[1][6] || curState[2][3];
+
+    if (shiftPressed && !shiftPressedLast)
+    {
+        // 按下事件
+        lastShiftPress = millis();
+        switch (shiftState)
+        {
+        case SYM_LOCK:
+            shiftState = SYM_EXITING_LOCK;
+            break;
+        case SYM_OFF:
+            shiftState = SYM_HOLD;
+            break;
+        default:
+            break;
+        }
+    }
+
+    else if (!shiftPressed && shiftPressedLast)
+    {
+        // 释放事件
+        unsigned long duration = millis() - lastShiftPress;
+
+        if (duration < LONG_PRESS_TIME)
+        {
+            // 短按 → 单击
+            if (millis() - lastClickTime < DOUBLE_CLICK_TIME)
+            {
+                shiftState = (shiftState == SYM_LOCK) ? SYM_OFF : SYM_LOCK;
+            }
+            else
+            {
+                switch (shiftState)
+                {
+                case SYM_SINGLE:
+                    shiftState = SYM_OFF;
+                    break;
+                case SYM_EXITING_LOCK:
+                    shiftState = SYM_OFF;
+                    break;
+                default:
+                    shiftState = SYM_SINGLE;
+                    break;
+                }
+            }
+            lastClickTime = millis();
+        }
+        else
+        {
+            shiftState = SYM_OFF;
+        }
+    }
+
+    shiftPressedLast = shiftPressed;
+}
+
+void altStateMachine()
+{
+    bool altPressed = curState[0][4];
+
+    if (altPressed && !altPressedLast)
+    {
+        // 按下事件
+        lastAltPress = millis();
+        switch (altState)
+        {
+        case SYM_LOCK:
+            altState = SYM_EXITING_LOCK;
+            break;
+        case SYM_OFF:
+            altState = SYM_HOLD;
+            break;
+        default:
+            break;
+        }
+    }
+
+    else if (!altPressed && altPressedLast)
+    {
+        // 释放事件
+        unsigned long duration = millis() - lastAltPress;
+
+        if (duration < LONG_PRESS_TIME)
+        {
+            // 短按 → 单击
+            if (millis() - lastClickTime < DOUBLE_CLICK_TIME)
+            {
+                altState = (altState == SYM_LOCK) ? SYM_OFF : SYM_LOCK;
+            }
+            else
+            {
+                switch (altState)
+                {
+                case SYM_SINGLE:
+                    altState = SYM_OFF;
+                    break;
+                case SYM_EXITING_LOCK:
+                    altState = SYM_OFF;
+                    break;
+                default:
+                    altState = SYM_SINGLE;
+                    break;
+                }
+            }
+            lastClickTime = millis();
+        }
+        else
+        {
+            altState = SYM_OFF;
+        }
+    }
+
+    altPressedLast = altPressed;
+}
+
+void loop()
+{
+    // 读取列状态
+    Wire.requestFrom(LILYGO_KB_SLAVE_ADDRESS, colCount);
+    uint8_t cols[colCount] = {0};
+    int got = 0;
+    while (Wire.available() && got < colCount)
+    {
+        cols[got++] = Wire.read();
+    }
+    if (symState == SYM_EXITING_SINGLE)
+        symState = SYM_OFF;
+    if (shiftState == SYM_EXITING_SINGLE)
+        shiftState = SYM_OFF;
+    if (altState == SYM_EXITING_SINGLE)
+        altState = SYM_OFF;
+    for (int col = 0; col < colCount; col++)
+    {
+        uint8_t val = cols[col];
+        for (int row = 0; row < rowCount; row++)
+        {
+            bool pressed = ((val >> row) & 0x01) != 0;
+            curState[col][row] = pressed;
+            if (pressed)
+            {
+                if (symState == SYM_SINGLE && keymap_symbol_flat[col * rowCount + row].hid != 0x00)
+                {
+                    symState = SYM_EXITING_SINGLE;
+                }
+                if (shiftState == SYM_SINGLE && keymap_symbol_flat[col * rowCount + row].hid != 0x00)
+                {
+                    shiftState = SYM_EXITING_SINGLE;
+                }
+                if (altState == SYM_SINGLE && keymap_symbol_flat[col * rowCount + row].hid != 0x00)
+                {
+                    altState = SYM_EXITING_SINGLE;
+                }
+            }
+        }
+    }
+
+    symStateMachine();
+    shiftStateMachine();
+    altStateMachine();
 
     // 构造并发送当前报告（仅在变化时）
     if (bleConnected && colChanged(cols, lastCols, colCount))
@@ -317,20 +472,21 @@ void loop()
         uint8_t report[8];
         buildCurrentReport(report);
         sendCurrentReport(report);
-        // if (reportChanged(report, lastReport))
-        // {
-        //     sendCurrentReport(report);
-        //     memcpy(lastReport, report, 8);
-        // }
         memcpy(lastCols, cols, colCount);
     }
 
     static SymState lastSymState = SYM_OFF;
-    if (symState != lastSymState)
+    static SymState lastShiftState = SYM_OFF;
+    static SymState lastAltState = SYM_OFF;
+    if (symState != lastSymState || shiftState != lastShiftState || altState != lastAltState)
     {
         tft.fillScreen(TFT_BLACK);
         tft.drawString(String(symState), 20, 20);
         lastSymState = symState;
+        tft.drawString(String(shiftState), 20, 40);
+        lastShiftState = shiftState;
+        tft.drawString(String(altState), 20, 60);
+        lastAltState = altState;
     }
     delay(15); // 扫描间隔
 }
